@@ -15,7 +15,7 @@ This project implements a parking system using STM32 microcontroller with bare-m
 - Keil uVision
 
 ## 📷 Demo
-![Parking System](images/parking.jpg)
+![Parking System](parking_system.jpg.jpg)
 
 ## 🚀 How It Works
 The system detects parking availability through input signals and controls output indicators accordingly using direct register-level programming.
