@@ -1,0 +1,335 @@
+#include "stm32f10x.h"
+uint8_t startup_done = 0;
+
+/* GREEN LED control */
+uint8_t green_led_on=0;  // Green LED state
+uint16_t green_led_timer=0; //Green LED ON duration counter
+
+/* RED LED control */
+uint8_t red_led_on=0;
+uint16_t red_led_timer=0;
+
+/* FULL display animation control */
+uint8_t full_active=0;  // FULL animation active flag
+uint8_t full_frame=0;   // Current animation frame
+uint16_t full_timer=0;  // Animation timing counter
+
+/* Entry / Exit lock to avoid miscounting */
+uint8_t entry_locked=0;
+uint8_t exit_locked=0;
+
+//initial parking space
+	uint8_t parking_space =6;
+
+//FUNCTION DECLARATION
+	//Delay function
+void delay_us(uint32_t us){
+		while(us--){
+			for(volatile uint32_t i=0;i<5;i++){
+		__NOP();
+			}
+	}
+	}
+void delay_ms(uint32_t ms){
+    while(ms--){
+        for(volatile uint32_t i=0; i<3700; i++){
+            __NOP();
+        }
+    }
+}
+
+/* ===================== TM1637 GPIO CONTROL ===================== */
+	//Enable DIO AND CLK
+		void enable_DIO(void){
+		  GPIOB->BSRR = (1<<6);  //PB6
+		}
+		void enable_CLK(void){
+		  GPIOB->BSRR = (1<<7);  //PB7
+		}
+		
+		//Disable DIO AND CLK
+		void disable_DIO(void){
+		  GPIOB->BRR = (1<<6);  //PB6
+		}
+		void disable_CLK(void){
+		  GPIOB->BRR = (1<<7);  //PB7
+		}
+		
+		/* TM1637 START condition */
+		//START condition occurs when: CLK = HIGH , DIO changes from HIGH to LOW
+		void TM1637_START(void){
+			enable_CLK();    // CLK = HIGH
+			enable_DIO();    // DIO = HIGH
+      delay_us(5);
+			disable_DIO();   // DIO goes LOW while CLK is HIGH
+			delay_us(5);
+		}
+		
+		
+/* TM1637 STOP condition */
+  //STOP condition occurs when:CLK = HIGH , DIO changes from LOW to HIGH
+		void TM1637_STOP(void){
+			disable_CLK();    //Reset timing, avoid glitches
+			delay_us(5);
+			disable_DIO();
+			delay_us(5);
+			enable_CLK();
+			delay_us(5);
+			enable_DIO();
+		}
+		
+/* ===================== TM1637 BYTE WRITE ===================== */
+/* Send 8-bit data to TM1637 (LSB first) */
+		void write_byte(uint8_t value ){
+			int i;
+				for (i=0;i<8;i++){
+				 uint8_t bit=value&0x01;    // Extract LSB
+				 disable_CLK();
+				 delay_us(10);
+						if(bit==1){
+							enable_DIO();
+						}
+						else{
+							disable_DIO();
+						
+						}
+				 delay_us(3);
+				 enable_CLK();      // Clock HIGH: data sampled
+				 delay_us(3);
+				 value=value>>1;   // Shift to next bit
+			}
+			 // ACK phase
+			disable_CLK();
+			enable_DIO();     // release line
+			delay_us(3);
+			enable_CLK();
+			delay_us(3);
+		}
+	//save digit for 7-segment display
+	uint8_t digit[13]={
+	  0x3F, //0
+		0x06, //1
+		0x5B, //2
+		0x4F, //3
+		0x66, //4
+		0x6D, //5
+		0x7D, //6 ,alternative for G
+		0x07, //7
+		0x7F, //8
+		0x6F, //9
+		0x71, //F    10
+		0x3E, //U 11
+		0x38 //L  12
+	};
+	
+	//Array for FULL animation
+	uint8_t full_scroll[6][4]={
+	  {0x00, 0x00, 0x00, 0x71}, // ---F
+    {0x00, 0x00, 0x71, 0x3E}, // --FU
+    {0x00, 0x71, 0x3E, 0x38}, // -FUL
+    {0x71, 0x3E, 0x38, 0x38}, // FULL
+    {0x3E, 0x38, 0x38, 0x00}, // ULL-
+    {0x38, 0x38, 0x00, 0x00}  // LL--
+	};	
+	
+/* ===================== DISPLAY FUNCTIONS ===================== */
+/* Display FULL scrolling animation */
+	void display_full(uint8_t frame){
+		
+			TM1637_START();
+			write_byte(0x40);    // Auto increment mode, After you write data to one display position, the TM1637 automatically moves to the next position by itself.
+			TM1637_STOP();
+			 
+			TM1637_START();
+			write_byte(0xC0);    // Start from D0
+			write_byte(0x00);  // D0
+			write_byte(full_scroll[frame][1]);  //D1
+			write_byte(full_scroll[frame][2]);  //D2
+			write_byte(full_scroll[frame][3]); //D3
+			TM1637_STOP();
+			
+			TM1637_START();
+			write_byte(0x8F);  // Display ON, max brightness
+			TM1637_STOP();
+				
+		
+	}
+	//Functiion to display groupname (G03)
+	void display_groupname(void){
+		  TM1637_START();
+			write_byte(0x40);
+			TM1637_STOP();
+			 
+			TM1637_START();
+			write_byte(0xC0);
+			write_byte(0x3D);        // D0 = G
+			write_byte(digit[0]);   // D1 = 0
+			write_byte(digit[3]);   // D2 = 3
+			write_byte(0x00);       // D3 = blank
+			TM1637_STOP();
+			
+			TM1637_START();
+			write_byte(0x8F);
+			TM1637_STOP();
+			
+	}
+/* Display parking space number (0 to 999) */
+		void display_digit(uint16_t value){
+		 
+		  uint8_t H;
+			uint8_t M;
+			uint8_t L;
+			
+			H=value/100;
+			M=(value/10)%10;    //Remove the units digit
+			L=value%10;         //Extract the last digit
+			
+			TM1637_START();
+			write_byte(0x40);
+			TM1637_STOP();
+			 
+			TM1637_START();
+			write_byte(0xC0);
+			write_byte(0x00);
+			write_byte(digit[H]);
+			write_byte(digit[M]);
+			write_byte(digit[L]); 
+			TM1637_STOP();
+			
+			TM1637_START();
+			write_byte(0x8F);
+			TM1637_STOP();
+			
+	
+		}
+	
+int main(void)
+
+{
+	
+  RCC->APB2ENR |= (1<<2); //enable port A
+	RCC->APB2ENR |= (1<<3); //enable port B
+	RCC->APB2ENR |= (1<<4); //enable port C
+	//IR SENSOR (ACTIVE HIGH)
+	GPIOB->CRH &= ~(0xF << 16);   // clear bits for PB12 (4*4=16)
+	GPIOB->CRH |=  (0x8 << 16);   // input with pull-down 0b1000=0x8 (input with pull down=10 ,input mode=00)
+	GPIOB->CRH &= ~(0xF << 20);   // clear bits for PB13 (5*4=20)
+	GPIOB->CRH |=  (0x8 << 20);   // input with pull-down
+	
+	//SET PULL-DOWN resistor to avoid floating situation,high when there is no car
+	GPIOB->ODR &=~ (1 << 12);   // PB12 pull-down
+	GPIOB->ODR &=~ (1 << 13);   // PB13 pull-down
+
+	
+	//Declare pin for LED ,each pin contain 4 bit 
+	GPIOB->CRL &= ~(0xF<<20);// GREEN LED (PB5) CLEAN, (5*4)=20
+	GPIOB->CRL |= (0x3<<20);// PUSH PULL OUTPUT AT PB5
+	GPIOB->CRH &= ~(0xF <<0); //RED LED (PB8)  (8-8)*4=0     
+	GPIOB->CRH |= (0X3<<0);
+	
+	//Declare pin for DIO and CLK for TM1637 Module
+	GPIOB->CRL &= ~(0xFF<<24);// clear config for PB6 & PB7
+	GPIOB->CRL |= (0x77<<24);// 0x77 = open-drain, 50MHz
+
+display_groupname();
+delay_ms(4000);
+
+	while (1){
+	/* Read ENTRY and EXIT IR sensor states
+	   PB12 = Entry sensor
+	   PB13 = Exit sensor
+	   Shift the bit to LSB and mask it to get 0 or 1 */
+		uint8_t entry_now = (GPIOB->IDR >> 12)&1;
+		uint8_t exit_now  = (GPIOB->IDR >> 13)&1;
+
+	 
+		/* ===================== ENTRY LOGIC ===================== */
+	/* Check:
+	   - entry is not locked (avoid multiple counts)
+	   - entry sensor is triggered
+	   - parking space is available */
+		if(entry_locked== 0 && entry_now == 1 && parking_space > 0){
+			parking_space--;    // Decrease available parking space
+			green_led_on=1;     // Enable green LED timer
+			green_led_timer=333;  // Green LED ON duration (333 x 3 ms =1s)
+			GPIOB->ODR |= (1<<5);  // Turn ON green LED (PB5)
+			
+			entry_locked=1; //Lock after counting ,to avoid miscounting
+		}
+		/* When entry sensor is cleared (car has passed),
+	   unlock entry and apply debounce delay */
+		if(entry_now==0){
+				entry_locked=0;
+			  delay_ms(500);
+		}
+		//EXIT
+		/* Check:
+	   - exit is not locked
+	   - exit sensor is triggered
+	   - parking space does not exceed maximum (6) */
+		if(exit_locked == 0 && exit_now == 1 && parking_space<6){
+		  parking_space++;   // Increase available parking space
+			red_led_on=1;      // Enable red LED timer
+			red_led_timer=333;   // Red LED ON duration (333 x 3 ms =1s)
+			GPIOB->ODR |= (1<<8);  // Turn ON red LED (PB8)
+			  
+			exit_locked=1;   //Lock after counting
+		}
+		if(exit_now==0){
+				exit_locked=0;
+			  delay_ms(500);
+		}
+			//parking space full
+		if(parking_space==0){
+			if(full_active==0){
+				full_active=1;     // Enable FULL animation
+				full_frame=0;      // Start from first frame
+				full_timer=501;     //If use 500, the first decrement happens immediately,
+                           //				so the actual delay becomes 499 ms. Using 501 corrects this off-by-one effect.
+			}
+		}else{
+			if(full_active==1){          //The moment parking is not full, number display takes over 
+			 full_active=0;
+			}
+		   display_digit(parking_space);
+		}
+		
+	/* ===================== GREEN LED TIMER ===================== */
+	/* Non-blocking green LED timing control */
+		if (green_led_on && green_led_timer>0){
+			green_led_timer--;
+			if(green_led_timer==0){
+			GPIOB->ODR &= ~(1<<5);   // Turn OFF green LED
+			green_led_on=0;	
+			}
+		}
+		/* ===================== RED LED TIMER ===================== */
+	/* Non-blocking red LED timing control */
+		if(red_led_on && red_led_timer>0){
+				red_led_timer--;
+			 if(red_led_timer==0){
+				GPIOB->ODR &= ~(1<<8);
+				red_led_on=0; 
+			 }
+		}
+	
+	/* ===================== FULL ANIMATION TIMING ===================== */
+	/* Control FULL animation frame update */
+		if (full_active && full_timer>0){
+			full_timer--;
+			/* Update animation frame when timer expires */
+			if(full_timer==0){
+			  display_full(full_frame);
+				full_frame++;
+				
+				/* Loop animation frames */
+				if(full_frame>=6){
+					full_frame=0;
+				}
+				full_timer=501;   //reset full_timmer to ensure having 500ms delay time between each character
+			}
+		}
+		/* Base delay for loop timing (1 ms resolution) */
+			delay_ms(1);
+	}
+}
